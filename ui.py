@@ -40,14 +40,14 @@ class WizproInspectionUI(QMainWindow):
 
         self.detector = detector if detector is not None else DetectionEngine(self.config)
 
-        # Delay Hikvision SDK import until after YOLO is initialized to avoid DLL conflicts.
-        from hikvision_cam import HikvisionCamera
+        from detection_thread import DetectionThread
+        self.detection_thread = DetectionThread(self.config, engine=self.detector)
+        self.detection_thread.result_ready.connect(self.on_detection_result_ready)
+        self.detection_thread.start()
 
-        self.cam = HikvisionCamera()
+        self.cam_thread = None
 
         self._build_ui()
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_live_feed)
         self._connect_camera()
 
     def _build_ui(self):
@@ -137,6 +137,17 @@ class WizproInspectionUI(QMainWindow):
         top_bar_layout = QHBoxLayout(top_bar)
         top_bar_layout.setContentsMargins(14, 12, 14, 12)
         top_bar_layout.setSpacing(12)
+
+        cam_label = QLabel("Camera")
+        cam_label.setObjectName("subtitle")
+        top_bar_layout.addWidget(cam_label)
+
+        self.camera_selector = QComboBox()
+        self.camera_selector.addItem("Hikvision", "Hikvision")
+        self.camera_selector.addItem("Baumer", "Baumer")
+        self.camera_selector.setCurrentIndex(0 if self.config.active_camera == "Hikvision" else 1)
+        self.camera_selector.currentIndexChanged.connect(self.on_camera_changed)
+        top_bar_layout.addWidget(self.camera_selector)
 
         mode_label = QLabel("Camera Mode")
         mode_label.setObjectName("subtitle")
@@ -275,13 +286,31 @@ class WizproInspectionUI(QMainWindow):
         parent_layout.addWidget(card)
         return value
 
+    def on_camera_changed(self, *_args):
+        camera = self.camera_selector.currentData()
+        if camera:
+            self.config.active_camera = camera
+            self.camera_label.setText(f"Camera: Connecting {camera}...")
+            self._connect_camera()
+
     def _connect_camera(self):
         try:
-            self.cam.enumerate()
-            self.cam.create_handle()
-            self.cam.open(trigger_mode=self.current_mode)
-            self.cam.start()
-            self.camera_label.setText("Camera: Connected")
+            if self.cam_thread is not None:
+                self.cam_thread.stop()
+                self.cam_thread = None
+
+            if self.config.active_camera == "Hikvision":
+                from hikvision_cam import HikvisionCameraThread
+                self.cam_thread = HikvisionCameraThread(self.config)
+            else:
+                from baumer_cam import BaumerCameraThread
+                self.cam_thread = BaumerCameraThread(self.config)
+
+            self.cam_thread.frame_captured.connect(self.on_frame_captured)
+            self.cam_thread.camera_connected.connect(lambda: self.camera_label.setText(f"Camera: Connected ({self.config.active_camera})"))
+            self.cam_thread.camera_disconnected.connect(lambda: self.camera_label.setText(f"Camera: Disconnected ({self.config.active_camera})"))
+            
+            self.cam_thread.start()
             self._apply_mode_ui(self.current_mode, initial=True)
         except Exception as exc:
             self.camera_label.setText("Camera: Not connected")
@@ -295,25 +324,19 @@ class WizproInspectionUI(QMainWindow):
     def apply_mode(self, mode, initial=False):
         self.current_mode = mode
 
-        try:
-            self.cam.set_trigger_mode(mode)
-        except Exception as exc:
-            self.status_label.setText(f"Status: Failed to switch mode - {exc}")
-            return
+        if self.cam_thread is not None:
+            self.cam_thread.set_trigger_mode(mode)
 
         self._apply_mode_ui(mode, initial=initial)
 
     def _apply_mode_ui(self, mode, initial=False):
         if mode == "software":
-            self.timer.stop()
             self.last_frame = None
             self.feed_label.clear()
             self.feed_label.setText("Waiting for software trigger...")
             self.mode_status.setText("Mode: Trigger Mode")
             self.status_label.setText("Status: Trigger mode active")
         else:
-            if not self.timer.isActive():
-                self.timer.start(self.config.live_refresh_ms)
             self.mode_status.setText("Mode: Continuous Live Feed")
             if self.detector.yolo_error:
                 self.status_label.setText(f"Status: Live feed started | {self.detector.yolo_error}")
@@ -323,30 +346,19 @@ class WizproInspectionUI(QMainWindow):
         if not initial:
             self.result_label.setText("Last Trigger Result: N/A")
 
-    def update_live_feed(self):
-        if self.current_mode == "software":
-            return
-
-        frame = self.cam.get_frame()
-        if frame is None:
-            return
-
+    def on_frame_captured(self, frame):
         normalized = self._normalize_frame(frame)
         if normalized is None:
             return
 
         self.last_frame = normalized
 
-        frame_to_show = normalized
         if self.detector.is_ready:
-            try:
-                detections = self.detector.detect(normalized)
-                if detections:
-                    frame_to_show = self.detector.annotate(normalized, detections)
-            except Exception as exc:
-                self.status_label.setText(f"Status: Live detection error - {exc}")
-
-        self._show_frame(frame_to_show)
+            self.detection_thread.enqueue(normalized)
+        else:
+            self._show_frame(normalized)
+            if self.current_mode == "software":
+                self.status_label.setText(f"Status: Captured frame only | {self.detector.yolo_error}")
 
     def _normalize_frame(self, frame):
         if frame is None:
@@ -363,7 +375,7 @@ class WizproInspectionUI(QMainWindow):
     def _show_frame(self, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg)
         scaled = pix.scaled(
             self.feed_label.width(),
@@ -413,53 +425,26 @@ class WizproInspectionUI(QMainWindow):
         is_good = min_good <= detection_count <= max_good
         return is_good, (not is_good)
 
-    def on_software_trigger(self):
-        try:
-            self.cam.send_software_trigger()
-            for _ in range(8):
-                frame = self.cam.get_frame()
-                if frame is not None:
-                    normalized = self._normalize_frame(frame)
-                    if normalized is not None:
-                        self.last_frame = normalized
-                    break
-                time.sleep(0.02)
-        except Exception:
-            pass
-
-        if self.current_mode == "software" and self.last_frame is None:
-            self.status_label.setText("Status: Waiting for software-triggered frame")
-
-        if self.last_frame is None:
-            self.status_label.setText("Status: No frame available for trigger")
+    def on_detection_result_ready(self, annotated, detections, is_good, is_bad, detection_count):
+        if self.current_mode == "continuous":
+            self._show_frame(annotated)
             return
 
-        frame = self.last_frame.copy()
-
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        raw_path = self.config.raw_images_dir / f"trigger_{stamp}.jpg"
-        cv2.imwrite(str(raw_path), frame)
-
-        if not self.detector.is_ready:
-            self.result_label.setText("Last Trigger Result: Frame captured only (no YOLO model loaded)")
-            self._show_frame(frame)
-            self.status_label.setText(f"Status: Captured frame only | {self.detector.yolo_error}")
-            return
-
-        detections = self.detector.detect(frame)
-        annotated = self.detector.annotate(frame, detections)
-
-        detection_count = len(detections)
-        is_good, is_bad = self._evaluate_quality(detection_count)
+        # Software trigger handling
         self.total_triggers += 1
-
-        annotated = self._draw_judgement_badge(annotated, is_bad, detection_count)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        
+        raw_path = self.config.raw_images_dir / f"trigger_{stamp}.jpg"
+        if self.last_frame is not None:
+            cv2.imwrite(str(raw_path), self.last_frame)
+        
+        annotated_with_badge = self._draw_judgement_badge(annotated, is_bad, detection_count)
+        self._show_frame(annotated_with_badge)
 
         ng_path = self.config.ng_images_dir / f"ng_{stamp}.jpg"
-
         if is_bad:
             self.bad_count += 1
-            cv2.imwrite(str(ng_path), annotated)
+            cv2.imwrite(str(ng_path), annotated_with_badge)
             top_labels = ", ".join(
                 [f"{det.class_name} {det.confidence:.2f}" for det in detections[:3]]
             )
@@ -475,17 +460,21 @@ class WizproInspectionUI(QMainWindow):
         self.bad_value.setText(str(self.bad_count))
         self.bad_percent_value.setText(f"{bad_pct:.1f}%")
 
-        self._show_frame(annotated)
         target = "ng_images" if is_bad else "good"
         self.status_label.setText(
             f"Status: Trigger #{self.total_triggers} saved | raw_images + {target} | detector={self.detector.backend_name}"
         )
 
+    def on_software_trigger(self):
+        if self.cam_thread:
+            self.cam_thread.send_software_trigger()
+            self.status_label.setText("Status: Software trigger sent, waiting for frame...")
+
     def closeEvent(self, event):
         try:
-            self.timer.stop()
-            self.cam.stop()
-            self.cam.close()
+            self.detection_thread.stop()
+            if self.cam_thread:
+                self.cam_thread.stop()
         except Exception:
             pass
         super().closeEvent(event)

@@ -8,9 +8,6 @@ def main() -> int:
     config = AppConfig(
         company_name="WIZPRO",
         app_name="Camera Quality Dashboard",
-        # Uses config default path: model/best.pt
-        # Example ROI: (120, 80, 1000, 700)
-        roi=None,
     )
 
     # Important on this machine: load YOLO/Torch before importing PyQt UI module.

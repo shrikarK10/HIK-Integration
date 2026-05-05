@@ -80,21 +80,7 @@ class DetectionEngine:
         if not self.is_ready:
             raise RuntimeError(self._yolo_error or "YOLO model is not available")
 
-        roi_frame, offset = self._apply_roi(frame)
-        detections = self._detect_with_yolo(roi_frame)
-        off_x, off_y = offset
-        return [
-            DetectionItem(
-                x=item.x + off_x,
-                y=item.y + off_y,
-                w=item.w,
-                h=item.h,
-                class_id=item.class_id,
-                class_name=item.class_name,
-                confidence=item.confidence,
-            )
-            for item in detections
-        ]
+        return self._detect_with_yolo(frame)
 
     def annotate(self, frame: np.ndarray, detections: List[DetectionItem]) -> np.ndarray:
         out = frame.copy()
@@ -102,10 +88,6 @@ class DetectionEngine:
         text_scale = 1
         text_thickness =3
         text_padding = 14
-
-        if self.config.roi is not None:
-            x, y, w, h = self.config.roi
-            cv2.rectangle(out, (x, y), (x + w, y + h), (16, 185, 129), 2)
 
         for item in detections:
             x, y, w, h = item.x, item.y, item.w, item.h
@@ -130,20 +112,6 @@ class DetectionEngine:
             )
 
         return out
-
-    def _apply_roi(self, frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
-        if self.config.roi is None:
-            return frame, (0, 0)
-
-        x, y, w, h = self.config.roi
-        fh, fw = frame.shape[:2]
-
-        x = max(0, min(x, fw - 1))
-        y = max(0, min(y, fh - 1))
-        w = max(1, min(w, fw - x))
-        h = max(1, min(h, fh - y))
-
-        return frame[y : y + h, x : x + w], (x, y)
 
     def _detect_with_yolo(self, frame: np.ndarray) -> List[DetectionItem]:
         try:

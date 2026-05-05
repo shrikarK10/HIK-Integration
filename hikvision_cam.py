@@ -93,7 +93,8 @@ class HikvisionCamera:
         data_buf = (hik.c_ubyte * buffer_size)()
         ret = self.sdk.MV_CC_GetImageForBGR(data_buf, buffer_size, self.frame_info, 1000)
         if ret != 0:
-            print(f"Frame grab failed: {ret}")
+            if ret != 2147483655:
+                print(f"Frame grab failed: {ret}")
             return None
 
         height = int(self.frame_info.nHeight)
@@ -116,3 +117,97 @@ class HikvisionCamera:
             self.sdk.MV_CC_CloseDevice()
         finally:
             self.sdk.MV_CC_DestroyHandle()
+
+
+from PyQt5.QtCore import QThread, pyqtSignal
+import time
+from config import AppConfig
+
+class HikvisionCameraThread(QThread):
+    frame_captured = pyqtSignal(object)
+    camera_connected = pyqtSignal()
+    camera_disconnected = pyqtSignal()
+
+    def __init__(self, config: AppConfig, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.camera = HikvisionCamera()
+        self._should_run = False
+        self._connected = False
+
+    def is_connected(self):
+        return self._connected
+
+    def set_trigger_mode(self, mode: str):
+        self.config.camera_trigger_mode = mode
+        if self._connected:
+            try:
+                self.camera.set_trigger_mode(mode)
+            except Exception as e:
+                print(f"HikvisionCameraThread: failed to set trigger mode: {e}")
+
+    def run(self):
+        self._should_run = True
+
+        while self._should_run:
+            if not self._connected:
+                try:
+                    self.camera.enumerate()
+                    self.camera.create_handle()
+                    self.camera.open(trigger_mode=self.config.camera_trigger_mode)
+                    self.camera.start()
+                    self._connected = True
+                    self.camera_connected.emit()
+                    print("HikvisionCameraThread: Camera connected and started")
+                except Exception as e:
+                    print(f"HikvisionCameraThread: Connection failed: {e}")
+                    time.sleep(2.0)
+                    continue
+
+            try:
+                if self.config.camera_trigger_mode == "continuous":
+                    frame = self.camera.get_frame()
+                    if frame is not None:
+                        self.frame_captured.emit(frame)
+                    else:
+                        time.sleep(0.01)
+                else:
+                    # In software mode, we just wait. The trigger will be sent manually
+                    # and the user/caller will have to retrieve the frame. But since we
+                    # are a continuous grab thread, maybe we should still try to get_frame
+                    # to process the trigger when it arrives.
+                    frame = self.camera.get_frame()
+                    if frame is not None:
+                        self.frame_captured.emit(frame)
+                    else:
+                        time.sleep(0.02)
+            except Exception as e:
+                print(f"HikvisionCameraThread: Error grabbing frame: {e}")
+                self._connected = False
+                self.camera_disconnected.emit()
+                try:
+                    self.camera.stop()
+                    self.camera.close()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+        try:
+            self.camera.stop()
+            self.camera.close()
+            self.camera_disconnected.emit()
+        except Exception:
+            pass
+        self._connected = False
+
+    def send_software_trigger(self):
+        if self._connected:
+            try:
+                self.camera.send_software_trigger()
+            except Exception as e:
+                print(f"HikvisionCameraThread: Software trigger failed: {e}")
+
+    def stop(self):
+        self._should_run = False
+        self.quit()
+        self.wait(1500)

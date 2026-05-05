@@ -1,0 +1,12 @@
+[2026-03-24 13:15:33] [DEBUG] MainApp - _init_database: DB initialized with indexes & Operating_Shifts reset
+[2026-03-24 13:16:02] [EXCEPTION] BaumerCameraThread - connect_camera: NotConnectedException: No device with '' found.
+Traceback (most recent call last):
+  File "C:\Wizpro\app_fi_soft_trigger\BaumerCameraThread.py", line 43, in connect_camera
+    cam.Connect()
+  File "C:\Wizpro\app_fi_soft_trigger\venv\lib\site-packages\neoapi\neoapi.py", line 19702, in Connect
+    return _neoapi.Cam_Connect(self, *args)
+neoapi.neoapi.NotConnectedException: NotConnectedException: No device with '' found.
+
+[2026-03-24 13:16:05] [EXCEPTION] DetectionThread - run: Model load failed: [Errno 2] No such file or directory: 'model\\best.pt'
+[2026-04-24 17:22:07] [DEBUG] MainApp - _init_database: DB initialized with indexes & Operating_Shifts reset
+[2026-04-24 17:22:07] [ERROR] BaumerCameraThread - connect_camera: neoapi import failed: No module named 'neoapi'
